@@ -4,7 +4,8 @@
 
 上传 Armbian 镜像（.tar.gz / .img）→ 只读挂载 → 按镜像内 dpkg 元数据把内核
 三件套（linux-image/dtb/headers-edge-rockchip64）重打包为标准 .deb → 建立
-Packages/Release 索引，通过 HTTP 提供局域网 apt 源。之后在任何设备上：
+Packages/Release 索引，通过 HTTP 提供局域网 apt 源。也可直接上传任意应用
+程序 .deb 入池，客户端同样通过 apt 安装/升级。之后在任何设备上：
 
     echo 'deb [trusted=yes] http://<本机IP>:8090/apt ./' > /etc/apt/sources.list.d/armbian-iter.list
     sudo apt update && sudo apt upgrade
@@ -41,6 +42,7 @@ POOL = REPO / "pool"
 ART_DIR = BASE / "artifacts"
 LOG_DIR = BASE / "logs"
 TMP = BASE / "tmp"
+QUAR = BASE / "quarantine"
 BOOT = Path("/boot")
 
 KERNEL_PKGS = ("linux-image-edge-rockchip64", "linux-dtb-edge-rockchip64",
@@ -219,27 +221,48 @@ def repack_pkg(pkg: str, src_root: Path, kver: str, out_dir: Path) -> Path:
     return out
 
 
+def deb_info(deb: Path):
+    """读取 .deb 控制字段并做基本校验；损坏/非标准包抛 RuntimeError。"""
+    out = run(["dpkg-deb", "-f", deb, "Package", "Version", "Architecture"])
+    kv = dict(re.findall(r"^([A-Za-z-]+):\s*(.*)$", out, re.M))
+    if not kv.get("Package") or not kv.get("Version"):
+        raise RuntimeError(f"无法读取 {deb.name} 的控制字段，不是标准 .deb")
+    return kv
+
+
 def build_index():
     """重建 apt 仓库索引（Packages / Packages.gz / Release），原子替换。"""
     with INDEX_LOCK:
-        entries, metas = [], []
+        entries, metas, archs = [], [], set()
         for deb in sorted(POOL.glob("*.deb")):
-            fields = run(["dpkg-deb", "-f", deb, "Package", "Version", "Architecture",
-                          "Maintainer", "Installed-Size", "Depends", "Provides",
-                          "Description"]).strip()
+            try:
+                fields = run(["dpkg-deb", "-f", deb, "Package", "Version", "Architecture",
+                              "Maintainer", "Installed-Size", "Depends", "Provides",
+                              "Description"]).strip()
+                kv = dict(re.findall(r"^([A-Za-z-]+):\s*(.*)$", fields, re.M))
+                if not kv.get("Package") or not kv.get("Version"):
+                    raise RuntimeError("元数据不完整")
+            except RuntimeError:
+                # 单个坏包只隔离自身，绝不让它卡死整个索引重建（含内核流水线）
+                QUAR.mkdir(parents=True, exist_ok=True)
+                shutil.move(str(deb), str(QUAR / f"{time.strftime('%H%M%S')}-{deb.name}"))
+                log.warning("池内损坏的 %s 已隔离到 quarantine/，不参与索引", deb.name)
+                continue
+            is_kernel = kv.get("Package") in KERNEL_PKGS
             data = deb.read_bytes()
             sha = hashlib.sha256(data).hexdigest()
             entry = fields + ("" if fields.endswith("\n") else "\n")
             entry += f"Filename: pool/{deb.name}\nSize: {len(data)}\nSHA256: {sha}\n"
             if "Section:" not in entry:
-                entry = entry.replace("Maintainer:", "Section: kernel\nMaintainer:", 1)
+                sec = "kernel" if is_kernel else "utils"
+                entry = entry.replace("Maintainer:", f"Section: {sec}\nMaintainer:", 1)
             entries.append(entry)
-            kv = dict(re.findall(r"^([A-Za-z-]+):\s*(.*)$", run(
-                ["dpkg-deb", "-f", deb, "Package", "Version"]), re.M))
-            d = {"pkg": kv.get("Package", "?"), "version": kv.get("Version", "?"),
-                 "file": deb.name, "size": len(data),
-                 "kver": kv.get("Version", "").split("+")[-1] if "+" in kv.get("Version", "") else ""}
-            metas.append(d)
+            ver = kv.get("Version", "?")
+            archs.add(kv.get("Architecture") or "arm64")
+            metas.append({"pkg": kv.get("Package", "?"), "version": ver,
+                          "file": deb.name, "size": len(data),
+                          "kind": "kernel" if is_kernel else "app",
+                          "kver": ver.split("+")[-1] if is_kernel and "+" in ver else ""})
         pkgs = "\n".join(entries)
         for name, content in (("Packages", pkgs.encode()),
                               ("Packages.gz", gzip.compress(pkgs.encode(), 6))):
@@ -253,8 +276,9 @@ def build_index():
                     hashlib.sha256(data).hexdigest(), len(data))
 
         rel = ["Origin: armbian-iter", "Label: armbian-iter", "Suite: iter",
-               "Codename: iter", "Architectures: arm64",
-               "Description: LAN iteration repo for Skysi-X5 (Armbian rockchip64 edge)",
+               "Codename: iter",
+               "Architectures: " + (" ".join(sorted(archs)) or "arm64"),
+               "Description: LAN apt repo: Armbian rockchip64 edge kernel trio + application debs",
                "Date: " + email.utils.formatdate(usegmt=True)]
         for field, idx in (("MD5Sum", 0), ("SHA1", 1), ("SHA256", 2)):
             rel.append(field + ":")
@@ -550,15 +574,30 @@ class Handler(BaseHTTPRequestHandler):
         cl = int(self.headers.get("Content-Length", 0))
         if cl <= 0:
             return self._json(400, {"error": "缺少 Content-Length"})
-        if name.endswith(".deb"):  # 直接投入仓库池
+        if name.endswith(".deb"):  # 应用/内核包：直接入池，客户端 apt install 即装
             if shutil.disk_usage("/").free < cl + 2 * 2**30:
                 return self._json(507, {"error": "磁盘空间不足"})
-            dst = POOL / name
             POOL.mkdir(parents=True, exist_ok=True)
-            self._stream_to(dst, cl)
+            TMP.mkdir(parents=True, exist_ok=True)
+            recv = TMP / f"recv-{uuid.uuid4().hex[:8]}"
+            try:
+                self._stream_to(recv, cl)
+                try:
+                    kv = deb_info(recv)  # 校验损坏包，避免污染索引
+                except RuntimeError as e:
+                    return self._json(400, {"error": str(e)})
+                replaced = (POOL / name).exists()
+                os.replace(recv, POOL / name)
+            finally:
+                recv.unlink(missing_ok=True)
             build_index()
-            log.info("直接入池 %s", name)
-            return self._json(200, {"added": name})
+            log.info("直接入池 %s（%s %s, %s）%s", name, kv.get("Package"),
+                     kv.get("Version"), kv.get("Architecture"),
+                     "，覆盖同名" if replaced else "")
+            return self._json(200, {"added": name, "pkg": kv.get("Package"),
+                                    "version": kv.get("Version"),
+                                    "arch": kv.get("Architecture", "?"),
+                                    "replaced": replaced})
         if shutil.disk_usage("/").free < cl + int(7.5 * 2**30):
             return self._json(507, {"error": f"磁盘空间不足（需约 {cl // 2**30 + 8} GB）"})
         aid = time.strftime("%Y%m%d-%H%M%S") + "-" + uuid.uuid4().hex[:6]
@@ -593,10 +632,21 @@ class Handler(BaseHTTPRequestHandler):
         if not src.is_file() or src.suffix not in (".gz", ".img", ".tgz", ".deb"):
             return self._json(400, {"error": "仅支持本地 .tar.gz/.tgz/.img/.deb"})
         if src.suffix == ".deb":
-            pool_add(src) if str(src).startswith(("/var/tmp/", "/tmp/")) else (
-                shutil.copy2(src, POOL / src.name))
+            try:
+                kv = deb_info(src)  # 校验后再入池
+            except RuntimeError as e:
+                return self._json(400, {"error": str(e)})
+            dst = POOL / src.name
+            # /root 工作区一律复制；/tmp、/var/tmp 下可移动，节省一次拷贝
+            if str(src).startswith("/root/") or not str(src).startswith(("/tmp/", "/var/tmp/")):
+                shutil.copy2(src, dst)
+            else:
+                shutil.move(src, dst)
             build_index()
-            return self._json(200, {"added": src.name})
+            log.info("导入应用包 %s（%s %s）", src.name, kv.get("Package"), kv.get("Version"))
+            return self._json(200, {"added": src.name, "pkg": kv.get("Package"),
+                                    "version": kv.get("Version"),
+                                    "arch": kv.get("Architecture", "?")})
         aid = time.strftime("%Y%m%d-%H%M%S") + "-" + uuid.uuid4().hex[:6]
         d = ART_DIR / aid
         d.mkdir(parents=True)
@@ -653,6 +703,7 @@ code{background:var(--bg);border:1px solid var(--line);padding:1px 6px;border-ra
 <input type="file" id="file" accept=".tar.gz,.tgz,.img,.deb">
 <button onclick="up()">上传并处理</button>
 <div id="bar"><div id="barfill"></div></div>
+<div class="muted" style="margin-top:8px">镜像（.img/.tar.gz）走后台重打包；直接上传 .deb（内核包或任意应用包）校验后立即入池，客户端 <code>apt update</code> 即可安装。</div>
 <div style="margin-top:10px" class="muted">服务器本地路径导入：
 <input type="text" id="lpath" placeholder="/var/tmp/xxx.img 或 .tar.gz 或 .deb" style="max-width:320px">
 <button class="ghost" onclick="imp()">导入</button>
@@ -684,9 +735,10 @@ async function load(){
   $('#howto').innerHTML=
    '<div class="muted">任意局域网设备（含本机）执行一次：</div>'+
    '<pre>echo "deb [trusted=yes] http://'+ip+':'+s.port+'/apt ./" | sudo tee /etc/apt/sources.list.d/armbian-iter.list\nsudo apt update\napt list --upgradable\nsudo apt upgrade   # 升级内核后重启生效</pre>'+
-   '<div class="muted">回滚示例：<code>sudo apt install linux-image-edge-rockchip64=26.11.0-trunk+7.2.4 linux-dtb-edge-rockchip64=26.11.0-trunk+7.2.4 linux-headers-edge-rockchip64=26.11.0-trunk+7.2.4 --allow-downgrades</code></div>';
-  const pr=(s.pool||[]).map(p=>'<tr><td class="mono">'+esc(p.pkg)+'</td><td class="mono">'+esc(p.version)+'</td><td>'+(p.kver?'<span class="badge b-dim">'+esc(p.kver)+'</span>':'')+'</td><td>'+(p.size/2**20).toFixed(1)+' MB</td><td><button class="warn" onclick="delp(\\''+esc(p.file)+'\\')">删除</button></td></tr>').join('');
-  $('#pool').innerHTML=(s.pool||[]).length?'<table><tr><th>包名</th><th>版本</th><th>内核</th><th>大小</th><th></th></tr>'+pr+'</table>':'<span class="muted">仓库为空：上传镜像或点“自打包当前内核”</span>';
+   '<div class="muted">回滚示例：<code>sudo apt install linux-image-edge-rockchip64=26.11.0-trunk+7.2.4 linux-dtb-edge-rockchip64=26.11.0-trunk+7.2.4 linux-headers-edge-rockchip64=26.11.0-trunk+7.2.4 --allow-downgrades</code></div>'+
+   '<div class="muted" style="margin-top:6px">安装/升级应用包：<code>sudo apt install 包名</code>（上传入池的任意 .deb 均可，<code>apt policy 包名</code> 可查可选版本）</div>';
+  const pr=(s.pool||[]).map(p=>'<tr><td class="mono">'+esc(p.pkg)+'</td><td class="mono">'+esc(p.version)+'</td><td>'+(p.kver?'<span class="badge b-dim">'+esc(p.kver)+'</span>':(p.kind==='app'?'<span class="badge b-dim">应用</span>':''))+'</td><td>'+(p.size/2**20).toFixed(1)+' MB</td><td><button class="warn" onclick="delp(\\''+esc(p.file)+'\\')">删除</button></td></tr>').join('');
+  $('#pool').innerHTML=(s.pool||[]).length?'<table><tr><th>包名</th><th>版本</th><th>类型</th><th>大小</th><th></th></tr>'+pr+'</table>':'<span class="muted">仓库为空：上传镜像或点“自打包当前内核”，或直接上传应用 .deb</span>';
   const ar=(s.artifacts||[]).map(a=>{
     const stt={done:'<span class="badge b-ok">完成</span>',processing:'<span class="badge b-warn">处理中</span>',extracting:'<span class="badge b-warn">解压中</span>',repacking:'<span class="badge b-warn">重打包中</span>',error:'<span class="badge b-err">失败</span>'}[a.state]||a.state;
     return '<tr><td>'+esc(a.name)+'<br><span class="muted mono">'+a.id+'</span></td><td>'+(a.kver?esc(a.kver):stt)+(a.suite?'<br><span class="muted">'+esc(a.suite)+'</span>':'')+(a.error?'<br><span style="color:var(--err)">'+esc(a.error)+'</span>':'')+'</td><td>'+((a.debs||[]).length?esc(a.debs.join('<br>')):'')+'</td><td>'+(a.state==='done'?'':'')+'<button class="warn" onclick="dela(\\''+a.id+'\\')">删除</button></td></tr>';
@@ -699,7 +751,7 @@ function up(){
  const x=new XMLHttpRequest();$('#bar').style.display='block';$('#upmsg').textContent='上传中…';
  x.open('POST','/api/upload?name='+encodeURIComponent(f.name));
  x.upload.onprogress=e=>{$('#barfill').style.width=(e.loaded/e.total*100)+'%'};
- x.onload=()=>{const j=JSON.parse(x.responseText);if(x.status>299)return alert('失败: '+(j.error||x.status));$('#upmsg').textContent='已接收 '+j.id+'，后台解包/重打包中（约 2-5 分钟）';setTimeout(load,1500)};
+ x.onload=()=>{const j=JSON.parse(x.responseText);if(x.status>299)return alert('失败: '+(j.error||x.status));$('#upmsg').textContent=j.id?('已接收 '+j.id+'，后台解包/重打包中（约 2-5 分钟）'):('已入池 '+(j.pkg||j.added)+' '+(j.version||'')+(j.replaced?'（覆盖同名）':'')+'，客户端 apt update 后可安装');setTimeout(load,1500)};
  x.onerror=()=>{$('#upmsg').textContent='网络错误'};
  x.send(f);
 }
@@ -713,7 +765,7 @@ load();loadLog();setInterval(load,5000);setInterval(loadLog,15000);
 
 
 def main():
-    for d in (BASE, REPO, POOL, ART_DIR, LOG_DIR, TMP):
+    for d in (BASE, REPO, POOL, ART_DIR, LOG_DIR, TMP, QUAR):
         d.mkdir(parents=True, exist_ok=True)
     logging.basicConfig(
         level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s",

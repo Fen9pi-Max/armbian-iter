@@ -1,6 +1,6 @@
 # 客户端文档
 
-本文档面向局域网内通过 apt 从 `armbian-iter` 仓库升级内核的设备(目标机)。
+本文档面向局域网内通过 apt 从 `armbian-iter` 仓库升级内核、安装应用包的设备(目标机)。
 只要是与镜像匹配的同板型 arm64 Debian/Armbian 设备即可,无需安装任何额外软件。
 
 服务端的部署与 API 请看 [server.md](server.md)。
@@ -80,7 +80,34 @@ sudo apt-mark hold linux-image-edge-rockchip64 linux-dtb-edge-rockchip64 linux-h
 > 注意:只能回退到**仓库池中仍存在**的版本。请勿在服务端随意删除旧版本 deb
 > (见 [server.md](server.md) 中 `DELETE /api/pool/` 的警告)。
 
-## 4. 不接入源、直接下载安装
+## 4. 安装与升级应用包
+
+除内核三件套外,服务端可直接上传**任意应用 `.deb`** 入池(见
+[server.md](server.md) 的 `/api/upload`)。客户端无需额外配置,接入仓库(§1)后即可
+像装普通软件一样安装:
+
+```bash
+sudo apt update
+apt policy myapp             # 查看仓库提供的所有版本
+sudo apt install myapp       # 安装(自动选最高版本)
+```
+
+升级与回退(池内多版本共存,方式与内核包一致):
+
+```bash
+sudo apt install myapp                            # 池内有更高版本即升级
+sudo apt install myapp=1.2.3 --allow-downgrades   # 精确回退到指定版本
+```
+
+注意:
+
+- 应用的依赖(`Depends`)需由客户端已配置的其他源(Debian/Armbian 官方源)满足,
+  或把依赖包的 deb 也上传到本仓库,否则 `apt install` 报依赖缺失;
+- `Architecture: all` 的包任何架构设备都能装;`arm64` 的包仅限 arm64 目标机
+  (x86 设备上 apt 不会选它,不报错);
+- 仓库未签名,接入用的 `[trusted=yes]` 已覆盖应用包,无需额外操作。
+
+## 5. 不接入源、直接下载安装
 
 一次性安装某几个包,不配置 apt 源:
 
@@ -90,7 +117,7 @@ curl -O http://192.168.1.10:8090/apt/pool/linux-image-edge-rockchip64_26.11.0-tr
 sudo apt install ./linux-image-edge-rockchip64_*.deb
 ```
 
-## 5. 移除仓库
+## 6. 移除仓库
 
 ```bash
 sudo rm /etc/apt/sources.list.d/armbian-iter.list
@@ -99,7 +126,7 @@ sudo apt update
 
 已安装的内核包不受影响;如需连同内核一起卸载,用 `apt remove` 处理对应三件套。
 
-## 6. 常见问题(客户端)
+## 7. 常见问题(客户端)
 
 **`apt update` 报 404 / 无法连接?**
 确认服务端 IP、端口与服务进程;源地址必须以 `/apt ./` 结尾(注意中间有空格)。

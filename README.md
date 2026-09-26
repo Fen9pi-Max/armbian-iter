@@ -27,6 +27,9 @@ Armbian 镜像(通过 `fdtfile` 配置适配板型)。
   绝不自动重启;绝不写入 `/root/armbain` 工作区。
 - **回滚友好**:每个 deb 版本号内嵌内核版本,可 `apt install pkg=version --allow-downgrades`
   精确回退;"自打包"可把当前已装内核打包入池作为基线。
+- **应用包直传分发**:任意应用 `.deb` 直接上传入池(上传时 `dpkg-deb` 校验,坏包拒收;
+  索引重建时发现的坏包自动隔离),目标机 `apt install 包名` 即装;多版本共存,升降级
+  与内核包一致。
 
 ## 工作原理
 
@@ -45,6 +48,7 @@ Armbian 镜像 (.tar.gz / .img)
               匿名只读 /apt/*  │  管理 API + Web UI(Basic token)
                                ▼
    局域网设备: apt update && apt upgrade → 内核三件套升级
+               apt install <包名>           → 应用包安装(.deb 直传入池)
 ```
 
 ## 快速开始
@@ -65,6 +69,7 @@ echo 'deb [trusted=yes] http://<服务器IP>:8090/apt ./' | sudo tee /etc/apt/so
 sudo apt update
 apt list --upgradable        # 查看可升级的内核三件套
 sudo apt upgrade             # 完成后择机重启
+sudo apt install <应用包名>   # 安装任意直传入池的应用 deb
 ```
 
 ## 文档

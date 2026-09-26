@@ -78,13 +78,14 @@ JSON 格式,修改后重启服务生效。
 /srv/armbian-iter/
 ├── repo/                          # apt 仓库根 = /apt/* 匿名只读区
 │   ├── Packages / Packages.gz     # 包索引(原子替换更新)
-│   ├── Release                    # 含 MD5/SHA1/SHA256 校验和
-│   ├── index-meta.json            # 池内包元数据(Web UI / /api/status 使用)
-│   └── pool/*.deb                 # 所有 deb 包
+│   ├── Release                    # 含 MD5/SHA1/SHA256 校验和;Architectures 按池内实际架构生成
+│   ├── index-meta.json            # 池内包元数据(Web UI / /api/status 使用,含 kind: kernel/app)
+│   └── pool/*.deb                 # 所有 deb 包(内核重打包产物 + 直传的应用包)
 ├── artifacts/<工件ID>/            # 每次上传一个目录
 │   ├── meta.json                  # 状态机元数据
 │   ├── image.img                  # 解出的镜像(处理完成后保留,可用于 reprocess)
 │   └── debs/                      # 重打包产物(入池后即从工件移除)
+├── quarantine/                    # 索引重建时发现损坏的 deb 自动移入此处,不参与索引
 ├── logs/service.log               # 滚动日志(5 MB × 3 份)
 └── tmp/                           # 打包临时目录(用后即删)
 ```
@@ -172,13 +173,20 @@ curl -u ":$TOKEN" -X POST -T Armbian_skysi-x5.img \
      "http://127.0.0.1:8090/api/upload?name=skysi-x5.img"
 # → 202 {"id": "20260925-100000-ab12cd", "state": "processing"}
 
-# 直接上传现成 .deb 入池(跳过流水线,立即重建索引)
-curl -u ":$TOKEN" -X POST -T xxx.deb "http://127.0.0.1:8090/api/upload?name=xxx.deb"
-# → 200 {"added": "xxx.deb"}
+# 直接上传应用/内核 .deb 入池(自动校验;损坏的包返回 400,不入池)
+curl -u ":$TOKEN" -X POST -T myapp_1.2.3_arm64.deb \
+     "http://127.0.0.1:8090/api/upload?name=myapp_1.2.3_arm64.deb"
+# → 200 {"added": "myapp_1.2.3_arm64.deb", "pkg": "myapp", "version": "1.2.3",
+#        "arch": "arm64", "replaced": false}
 ```
 
 - `.img` / `.tar.gz` / `.tgz`:走完整流水线,磁盘需 `镜像体积 + ~7.5 GB` 空闲,否则 507;
-- `.deb`:直接入池,需 `体积 + 2 GB` 空闲;
+- `.deb`:**应用包直传通道**——先落临时区并用 `dpkg-deb` 读取控制字段校验,通过后原子
+  入池并立即重建索引,客户端 `apt update` 后即可 `apt install <包名>` 安装;
+  需 `体积 + 2 GB` 空闲;同名文件被覆盖(响应 `replaced: true`);损坏/非标准 deb
+  返回 400 与错误信息,不会污染索引;
+- `Release` 的 `Architectures` 按池内实际架构动态生成(如 `all arm64`);应用包在
+  Web UI 包列表中以「应用」标记,与内核包(显示内核版本)区分;
 - 文件名会被规范化为 `[A-Za-z0-9._+-]`。
 
 ### POST `/api/import` — 导入服务器本地路径
@@ -187,9 +195,11 @@ curl -u ":$TOKEN" -X POST -T xxx.deb "http://127.0.0.1:8090/api/upload?name=xxx.
 
 ```bash
 curl -u ":$TOKEN" -X POST -H 'Content-Type: application/json' \
-     -d '{"path": "/var/tmp/Armbian_skysi-x5.tar.gz"}' \
+     -d '{"path": "/var/tmp/Armbian_skysi-x5_tar.gz"}' \
      http://127.0.0.1:8090/api/import
-# → 202 {"id": "...", "state": "processing"}   (.deb 则 → 200 {"added": "..."} )
+# → 202 {"id": "...", "state": "processing"}
+# .deb 则 → 200 {"added": "...", "pkg": "...", "version": "...", "arch": "..."}
+#          (损坏的 .deb → 400)
 ```
 
 规则:位于 `/tmp`、`/var/tmp` 且不在 `/root` 下的文件**移动**(不占双倍空间),
@@ -272,6 +282,14 @@ http://<IP>:8090/apt/pool/<xxx.deb>  # 下载单个包
 
 **忘了 token?**
 直接编辑 `/etc/armbian-iter.conf` 修改 `token` 字段后重启服务即可。
+
+**上传应用 .deb 返回 400"不是标准 .deb"?**
+文件损坏或不是 deb 格式(常见:传输中断、传了改名的非 deb 文件)。错误信息中含
+`dpkg-deb` 的具体报错;确认文件完整后重传即可。
+
+**池里发现坏包怎么办?**
+索引重建时无法读取的 deb 会被自动移到 `/srv/armbian-iter/quarantine/`,不参与索引,
+也不会卡死内核流水线;确认无用后可手动清理该目录。
 
 **改端口后客户端 404?**
 客户端源里的端口必须同步更新为 `http://<IP>:<新端口>/apt ./`。
