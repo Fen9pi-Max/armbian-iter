@@ -1,5 +1,10 @@
 # Armbian Iter — 局域网内核迭代 APT 仓库
 
+![License](https://img.shields.io/badge/license-MIT-green)
+![Python](https://img.shields.io/badge/python-%3E%3D3.8-blue)
+![Dependencies](https://img.shields.io/badge/dependencies-none-success)
+![Target](https://img.shields.io/badge/target-arm64%20%C2%B7%20rockchip64-orange)
+
 单文件、仅 Python 标准库的局域网 APT 仓库服务。上传 Armbian 镜像(`.tar.gz` / `.img`),
 服务自动只读挂载镜像,依据镜像内 dpkg 元数据把**内核三件套**
 (`linux-image` / `linux-dtb` / `linux-headers`,rockchip64 edge)重打包为标准 `.deb`,
@@ -33,22 +38,40 @@ Armbian 镜像(通过 `fdtfile` 配置适配板型)。
 
 ## 工作原理
 
-```
-Armbian 镜像 (.tar.gz / .img)
-        │  POST /api/upload 或 /api/import
-        ▼
-┌─────────────────── armbian-iter 服务 (root) ───────────────────┐
-│ 解压出唯一 .img → 解析分区表 → losetup 只读挂载                  │
-│ 校验:镜像内单一 vmlinuz-*、本机 dtb 存在                         │
-│ 从 var/lib/dpkg/status + info/*.list 重打包内核三件套为 .deb     │
-│ (dpkg-deb -Zzstd,版本 = 原版本 + <kver>)                       │
-│ 入池 pool/ → 原子重建 Packages / Packages.gz / Release          │
-└──────────────────────────────┬──────────────────────────────────┘
-                               │ HTTP :8090
-              匿名只读 /apt/*  │  管理 API + Web UI(Basic token)
-                               ▼
-   局域网设备: apt update && apt upgrade → 内核三件套升级
-               apt install <包名>           → 应用包安装(.deb 直传入池)
+```mermaid
+flowchart TB
+    subgraph admin["管理端 · Web UI / curl(Basic token)"]
+        A1["Armbian 镜像<br/>.tar.gz / .img"]
+        A2["应用 .deb"]
+    end
+
+    subgraph server["服务端 · armbian-iter(root · 纯 Python 标准库 · 监听 :8090)"]
+        direction TB
+        UP["POST /api/upload · /api/import"]
+        PIPE["镜像流水线<br/>解出唯一 .img → 解析分区表 → 只读挂载<br/>校验单内核与本机 dtb<br/>按 dpkg 元数据重打包内核三件套<br/>(版本 = 原版本 + 内核版本)"]
+        VET["dpkg-deb 校验<br/>(损坏 → 400 拒收)"]
+        POOL[("pool/ 包池<br/>内核三件套 + 应用包")]
+        IDX["Packages / Packages.gz / Release<br/>原子重建 · Architectures 动态生成"]
+        APT["/apt/* · 匿名只读"]
+        QUAR["quarantine/ · 坏包隔离"]
+    end
+
+    subgraph clients["局域网目标机(arm64 · 无需额外软件)"]
+        C1["apt update → apt upgrade<br/>内核三件套升级(择机自行重启)"]
+        C2["apt install 包名<br/>应用包安装 / 升级 / 回退"]
+    end
+
+    A1 --> UP
+    A2 --> UP
+    UP -->|"镜像"| PIPE
+    UP -->|"deb 直传"| VET
+    VET -->|"校验通过"| POOL
+    PIPE --> POOL
+    POOL --> IDX
+    IDX -.->|"坏包"| QUAR
+    IDX --> APT
+    APT --> C1
+    APT --> C2
 ```
 
 ## 快速开始
