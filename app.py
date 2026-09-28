@@ -670,7 +670,7 @@ class Handler(BaseHTTPRequestHandler):
 
 
 PAGE = """<!doctype html>
-<html lang="zh"><head><meta charset="utf-8"><title>Armbian Iter · 系统迭代仓库</title>
+<html lang="zh"><head><meta charset="utf-8"><title>Armbian Iter · 系统迭代仓库</title><link rel="icon" href="data:,">
 <style>
 :root{--bg:#12141a;--card:#1c1f27;--line:#2b2f3a;--fg:#e6e8ee;--dim:#9aa1af;--acc:#4f8cff;--ok:#3fb96f;--warn:#e0a83c;--err:#e05c5c}
 *{box-sizing:border-box}body{margin:0;font:14px/1.6 system-ui,-apple-system,"Noto Sans CJK SC",sans-serif;background:var(--bg);color:var(--fg)}
@@ -734,7 +734,7 @@ async function load(){
   const ip=s.lan_ip||'&lt;本机IP&gt;';
   $('#howto').innerHTML=
    '<div class="muted">任意局域网设备（含本机）执行一次：</div>'+
-   '<pre>echo "deb [trusted=yes] http://'+ip+':'+s.port+'/apt ./" | sudo tee /etc/apt/sources.list.d/armbian-iter.list\nsudo apt update\napt list --upgradable\nsudo apt upgrade   # 升级内核后重启生效</pre>'+
+   '<pre>echo "deb [trusted=yes] http://'+ip+':'+s.port+'/apt ./" | sudo tee /etc/apt/sources.list.d/armbian-iter.list\\nsudo apt update\\napt list --upgradable\\nsudo apt upgrade   # 升级内核后重启生效</pre>'+
    '<div class="muted">回滚示例：<code>sudo apt install linux-image-edge-rockchip64=26.11.0-trunk+7.2.4 linux-dtb-edge-rockchip64=26.11.0-trunk+7.2.4 linux-headers-edge-rockchip64=26.11.0-trunk+7.2.4 --allow-downgrades</code></div>'+
    '<div class="muted" style="margin-top:6px">安装/升级应用包：<code>sudo apt install 包名</code>（上传入池的任意 .deb 均可，<code>apt policy 包名</code> 可查可选版本）</div>';
   const pr=(s.pool||[]).map(p=>'<tr><td class="mono">'+esc(p.pkg)+'</td><td class="mono">'+esc(p.version)+'</td><td>'+(p.kver?'<span class="badge b-dim">'+esc(p.kver)+'</span>':(p.kind==='app'?'<span class="badge b-dim">应用</span>':''))+'</td><td>'+(p.size/2**20).toFixed(1)+' MB</td><td><button class="warn" onclick="delp(\\''+esc(p.file)+'\\')">删除</button></td></tr>').join('');
