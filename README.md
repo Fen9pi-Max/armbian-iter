@@ -4,6 +4,7 @@
 ![Python](https://img.shields.io/badge/python-%3E%3D3.8-blue)
 ![Dependencies](https://img.shields.io/badge/dependencies-none-success)
 ![Target](https://img.shields.io/badge/target-arm64%20%C2%B7%20rockchip64-orange)
+[![UI Test](https://github.com/Fen9pi-Max/armbian-iter/actions/workflows/ui-test.yml/badge.svg)](https://github.com/Fen9pi-Max/armbian-iter/actions/workflows/ui-test.yml)
 
 单文件、仅 Python 标准库的局域网 APT 仓库服务。上传 Armbian 镜像(`.tar.gz` / `.img`),
 服务自动只读挂载镜像,依据镜像内 dpkg 元数据把**内核三件套**
@@ -134,6 +135,21 @@ LICENSE
   (`secrets.token_urlsafe(18)`,常量时间比较)。
 - 服务**绝不**主动重启任何机器;内核升级后由管理员在客户端择机重启。
 - 镜像只读挂载,处理失败不影响镜像工件本身,可删除重传或 `reprocess` 重试。
+
+## 测试
+
+`tests/ui_test.py` 用 Playwright + 真实 Chromium 对 Web UI 做端到端测试:自起沙箱服务
+(`ITER_CONF` / `ITER_BASE` 指向临时目录,不碰系统路径),覆盖页面加载、.deb 上传 /
+本地导入 / 删除重建索引、坏包拒收、apt 索引一致性,并把**零 JS 异常、零控制台错误**
+作为硬性门槛——页面曾因一处 JS 字符串跨行导致整段脚本解析失败、所有按钮失效,
+此门槛专门防止同类回归。
+
+```bash
+pip install playwright && playwright install --with-deps chromium
+python3 tests/ui_test.py
+```
+
+GitHub Actions 在每次推送时自动运行([.github/workflows/ui-test.yml](.github/workflows/ui-test.yml))。
 
 ## License
 

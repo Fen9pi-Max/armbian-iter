@@ -71,6 +71,13 @@ JSON 格式,修改后重启服务生效。
 | `fdtfile` | str | 读服务器 `/boot/armbianEnv.txt` 的 `fdtfile=` | **目标板型**的设备树文件名,如 `rk3588s-skysi-x5.dtb`。服务器与目标板型不同(如 x86 服务器)时必须显式配置,否则镜像校验会失败 |
 | `disable_selfpack` | bool | `false` | 为真时 `POST /api/selfpack` 返回 403。服务器自身是 x86 时建议开启,避免把 x86 内核打包进 arm64 仓库 |
 
+路径也可用环境变量覆盖(供测试 / CI 使用沙箱目录,正常部署无需设置):
+
+| 环境变量 | 默认 | 说明 |
+| --- | --- | --- |
+| `ITER_CONF` | `/etc/armbian-iter.conf` | 配置文件路径 |
+| `ITER_BASE` | `/srv/armbian-iter` | 数据目录根(repo/artifacts/logs/tmp/quarantine) |
+
 ## 4. 目录布局
 
 ```
