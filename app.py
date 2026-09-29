@@ -871,7 +871,7 @@ async function load(){
   $('#pool').innerHTML=(s.pool||[]).length?'<table><tr><th>包名</th><th>版本</th><th>类型</th><th>大小</th><th></th></tr>'+pr+'</table>':'<span class="muted">仓库为空：上传镜像或点“自打包当前内核”，或直接上传应用 .deb</span>';
   const ar=(s.artifacts||[]).map(a=>{
     const stt={done:'<span class="badge b-ok">完成</span>',processing:'<span class="badge b-warn">处理中</span>',extracting:'<span class="badge b-warn">解压中</span>',repacking:'<span class="badge b-warn">重打包中</span>',error:'<span class="badge b-err">失败</span>'}[a.state]||a.state;
-    return '<tr><td>'+esc(a.name)+'<br><span class="muted mono">'+a.id+'</span></td><td>'+(a.kver?esc(a.kver):stt)+(a.suite?'<br><span class="muted">'+esc(a.suite)+'</span>':'')+(a.error?'<br><span style="color:var(--err)">'+esc(a.error)+'</span>':'')+'</td><td>'+((a.debs||[]).length?a.debs.map(d=>esc(d)).join('<br>'):'')+'</td><td>'+(a.state==='done'?'':'')+'<button class="warn" onclick="dela(\\''+a.id+'\\')">删除</button></td></tr>';
+    return '<tr><td>'+esc(a.name)+'<br><span class="muted mono">'+a.id+'</span></td><td>'+(a.kver?esc(a.kver):stt)+(a.suite?'<br><span class="muted">'+esc(a.suite)+'</span>':'')+(a.error?'<br><span style="color:var(--err)">'+esc(a.error)+'</span>':'')+'</td><td>'+((a.debs||[]).length?a.debs.map(d=>esc(d)).join('<br>'):'')+'</td><td>'+(a.state==='error'?'<button class="ghost" onclick="rep(\\''+a.id+'\\')">重新处理</button>':'')+'<button class="warn" onclick="dela(\\''+a.id+'\\')">删除</button></td></tr>';
   }).join('');
   $('#arts').innerHTML=ar?'<table><tr><th>工件</th><th>状态</th><th>入池 deb</th><th></th></tr>'+ar+'</table>':'<span class="muted">无</span>';
  }catch(e){$('#stat').innerHTML='<div class="kv"><div class="v" style="color:var(--err)">'+esc(e.message)+'</div></div>'}
@@ -921,6 +921,7 @@ async function imp(){const p=$('#lpath').value.trim();if(!p)return;try{const j=a
 async function selfpack(){if(!confirm('把本机当前内核重打包入池（回滚基线）？'))return;try{await api('/api/selfpack',{method:'POST'});$('#upmsg').textContent='自打包已开始…';setTimeout(load,2000)}catch(e){alert(e.message)}}
 async function delp(f){if(!confirm('从仓库删除 '+f+' 并重建索引？'))return;try{await api('/api/pool/'+f,{method:'DELETE'})}catch(e){alert(e.message)}load()}
 async function dela(id){if(!confirm('删除工件 '+id+'（已入池的 deb 不受影响）？'))return;try{await api('/api/artifacts/'+id,{method:'DELETE'})}catch(e){alert(e.message)}load()}
+async function rep(id){try{await api('/api/artifacts/'+id+'/reprocess',{method:'POST'});$('#upmsg').textContent='已重新排队处理 '+id+'（无需重新上传）';setTimeout(load,1500)}catch(e){alert(e.message)}}
 async function loadLog(){try{const j=await api('/api/logs?n=150');$('#logv').textContent=j.lines.join('\\n')||'(空)'}catch(e){}}
 load();loadLog();setInterval(load,5000);setInterval(loadLog,15000);
 </script></body></html>"""

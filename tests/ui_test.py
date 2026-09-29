@@ -205,6 +205,13 @@ def main():
             page.unroute("**/api/upload*", flaky)
             check("工件出现(后台处理)", lambda: expect(page.locator("#arts")).to_contain_text(
                 "chunkui.img", timeout=10000))
+            check("失败工件显示「重新处理」按钮", lambda: expect(
+                page.get_by_role("button", name="重新处理").first).to_be_visible(timeout=15000))
+            with page.expect_response(lambda r: "/reprocess" in r.url) as ri:
+                page.get_by_role("button", name="重新处理").first.click()
+            assert ri.value.status == 202, f"reprocess 应 202: {ri.value.status}"
+            PASSED.append("失败工件一键重新处理")
+            print("  ✓ 失败工件一键重新处理")
             for m in console_errors[allowed_errors:]:
                 assert ("net::ERR_FAILED" in m or "Failed to load resource" in m), \
                     f"意外控制台错误: {m}"
