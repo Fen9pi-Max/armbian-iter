@@ -305,10 +305,13 @@ def build_index():
                 log.warning("池内损坏的 %s 已隔离到 quarantine/，不参与索引", deb.name)
                 continue
             is_kernel = kv.get("Package") in KERNEL_PKGS
-            data = deb.read_bytes()
-            sha = hashlib.sha256(data).hexdigest()
+            sha, size = hashlib.sha256(), 0  # 分块流式哈希,不整读进内存
+            with open(deb, "rb") as f:
+                while chunk := f.read(4 * 1024 * 1024):
+                    sha.update(chunk)
+                    size += len(chunk)
             entry = fields + ("" if fields.endswith("\n") else "\n")
-            entry += f"Filename: pool/{deb.name}\nSize: {len(data)}\nSHA256: {sha}\n"
+            entry += f"Filename: pool/{deb.name}\nSize: {size}\nSHA256: {sha.hexdigest()}\n"
             if "Section:" not in entry:
                 sec = "kernel" if is_kernel else "utils"
                 entry = entry.replace("Maintainer:", f"Section: {sec}\nMaintainer:", 1)
@@ -316,7 +319,7 @@ def build_index():
             ver = kv.get("Version", "?")
             archs.add(kv.get("Architecture") or "arm64")
             metas.append({"pkg": kv.get("Package", "?"), "version": ver,
-                          "file": deb.name, "size": len(data),
+                          "file": deb.name, "size": size,
                           "kind": "kernel" if is_kernel else "app",
                           "kver": ver.split("+")[-1] if is_kernel and "+" in ver else ""})
         pkgs = "\n".join(entries)
@@ -381,6 +384,12 @@ def set_state(aid, **kw):
 
 def process_artifact(aid):
     try:
+        # 后台流水线主动降优先级:重打包/解压让出 CPU 给 Web UI 等交互请求,
+        # 子进程(tar/dpkg-deb/zstd)继承该 nice 值
+        try:
+            os.nice(10)
+        except OSError:
+            pass
         with JOB_LOCK:
             meta = meta_read(aid)
             d = art_dir(aid)
@@ -449,6 +458,10 @@ def selfpack():
     """把本机已装内核重打包入池，作为可回滚基线。"""
     def work():
         try:
+            try:
+                os.nice(10)
+            except OSError:
+                pass
             with JOB_LOCK:
                 kver = platform.release()
                 out = TMP / f"self-{uuid.uuid4().hex[:6]}"
@@ -775,7 +788,6 @@ class Handler(BaseHTTPRequestHandler):
         self._json(202, {"id": aid, "state": "processing"})
 
     def _stream_to(self, dst: Path, cl: int, mode: str = "wb"):
-        h = hashlib.sha256()
         remaining = cl
         with open(dst, mode) as f:
             while remaining:
@@ -783,9 +795,7 @@ class Handler(BaseHTTPRequestHandler):
                 if not chunk:
                     raise RuntimeError("上传中断")
                 f.write(chunk)
-                h.update(chunk)
                 remaining -= len(chunk)
-        return h.hexdigest()
 
     def _import_local(self, raw):
         src = Path(raw).resolve()
