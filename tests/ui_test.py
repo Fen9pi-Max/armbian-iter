@@ -84,6 +84,36 @@ def main():
         else:
             raise RuntimeError("服务未在 10s 内就绪")
 
+        print("— fdtfile 多来源探测(RK 无 armbianEnv.txt 场景回归)—")
+        os.environ["ITER_CONF"] = str(tmp / "conf.json")  # 复用沙箱 conf,不碰 /etc
+        sys.path.insert(0, str(ROOT))
+        import app as appmod
+        boot = tmp / "fakeboot"
+        (boot / "extlinux").mkdir(parents=True)
+        appmod.BOOT, appmod.CONF = boot, {"port": 1}
+        appmod.PROC_DT = tmp / "no-proc-dt"
+        assert appmod.host_fdtfile() is None, "无任何来源时应返回 None 而非抛 FileNotFoundError"
+        (boot / "uEnv.txt").write_text("fdtfile=rk3399-nanopc-t4.dtb\n")
+        assert appmod.host_fdtfile() == "rk3399-nanopc-t4.dtb", "uEnv.txt 探测"
+        (boot / "armbianEnv.txt").write_text("verbosity=7\nfdtfile=rk3588s-skysi-x5.dtb\n")
+        assert appmod.host_fdtfile() == "rk3588s-skysi-x5.dtb", "armbianEnv.txt 优先"
+        (boot / "armbianEnv.txt").unlink()
+        (boot / "uEnv.txt").unlink()
+        (boot / "extlinux" / "extlinux.conf").write_text(
+            "label Armbian\n  linux /Image\n  fdt /dtb/rockchip/rk3399-nanopc-t4.dtb\n")
+        assert appmod.host_fdtfile() == "rk3399-nanopc-t4.dtb", "extlinux FDT 行探测"
+        (boot / "extlinux" / "extlinux.conf").unlink()
+        (boot / "dtb").mkdir()
+        (boot / "dtb" / "rk3399-nanopc-t4.dtb").write_bytes(b"x")
+        appmod.PROC_DT = tmp / "compat"
+        appmod.PROC_DT.write_bytes(b"rockchip,rk3399-nanopc-t4\0rockchip,rk3399\0")
+        assert appmod.host_fdtfile() == "rk3399-nanopc-t4.dtb", "compatible 推断"
+        assert "conf" in appmod.fdtfile_msg(None) and "fdtfile" in appmod.fdtfile_msg(None)
+        appmod.CONF = {"fdtfile": "manual.dtb"}
+        assert appmod.host_fdtfile() == "manual.dtb", "conf 指定最高优先"
+        PASSED.append("fdtfile 多来源探测")
+        print("  ✓ fdtfile 多来源探测")
+
         good1 = make_deb(tmp / "helloui_1.0_all.deb", "helloui", "1.0")
         good2 = make_deb(tmp / "fakeui_0.1_all.deb", "fakeui", "0.1")
         bad = tmp / "broken.deb"

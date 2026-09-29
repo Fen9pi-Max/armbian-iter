@@ -68,8 +68,17 @@ JSON 格式,修改后重启服务生效。
 | --- | --- | --- | --- |
 | `token` | str | 首次启动随机生成 | 管理接口密码(Basic 认证,用户名任意)。置空字符串可关闭认证(**不建议**) |
 | `port` | int | `8090` | HTTP 监听端口。改动后客户端源地址需同步修改 |
-| `fdtfile` | str | 读服务器 `/boot/armbianEnv.txt` 的 `fdtfile=` | **目标板型**的设备树文件名,如 `rk3588s-skysi-x5.dtb`。服务器与目标板型不同(如 x86 服务器)时必须显式配置,否则镜像校验会失败 |
+| `fdtfile` | str | 自动探测(见下) | **目标板型**的设备树文件名,如 `rk3588s-skysi-x5.dtb`。服务器与目标板型不同(如 x86/RK3399 服务器分发 RK3588 镜像)时**必须显式配置**,否则镜像校验会拒绝 |
 | `disable_selfpack` | bool | `false` | 为真时 `POST /api/selfpack` 返回 403。服务器自身是 x86 时建议开启,避免把 x86 内核打包进 arm64 仓库 |
+
+未配置 `fdtfile` 时按以下顺序自动探测,任何一步缺失都不会报错,全部失败则返回
+`None` 并在校验环节给出设置指引:
+
+1. `/boot/armbianEnv.txt`、`/boot/boot.env`、`/boot/uEnv.txt` 中的 `fdtfile=` 行
+   (RK 平台部分固件没有 armbianEnv.txt);
+2. `/boot/extlinux/extlinux.conf` 的 `fdt` 行;
+3. `/proc/device-tree/compatible` 推断**服务器本机**板型,并在 `/boot/dtb*/` 中
+   验证存在——仅当服务器与目标板同板型时推断结果才正确。
 
 路径也可用环境变量覆盖(供测试 / CI 使用沙箱目录,正常部署无需设置):
 
@@ -292,9 +301,12 @@ http://<IP>:8090/apt/pool/<xxx.deb>  # 下载单个包
 镜像流水线需要 `镜像 + ~8 GB` 临时空间。清理 `artifacts/` 中不再需要 `reprocess`
 的旧工件,或换更大磁盘。
 
-**工件报错「镜像缺少本机 dtb」?**
-镜像内没有配置 `fdtfile` 对应的设备树。若目标是 Skysi-X5 而服务器不是,在
-`/etc/armbian-iter.conf` 中显式设置 `"fdtfile": "rk3588s-skysi-x5.dtb"` 后 reprocess。
+**工件报错「镜像缺少本机 dtb」或「未确定 fdtfile」?**
+镜像内没有校验所需的目标板设备树。RK3399 等板型的 `/boot` 可能没有
+`armbianEnv.txt`,自动探测会依次尝试 boot.env / uEnv.txt / extlinux / 本机设备树,
+若仍确定不了(或服务器与目标板型不同,如 RK3399 服务器分发 Skysi-X5/RK3588 镜像),
+在 `/etc/armbian-iter.conf` 显式设置 `"fdtfile": "rk3588s-skysi-x5.dtb"` 后重启服务,
+再对工件点 reprocess(镜像已保留,无需重新上传)。
 
 **工件报错「镜像内内核数量异常」?**
 仅支持单内核镜像。镜像里同时存在多个 `vmlinuz-*` 时拒绝处理,请上传干净的官方镜像。

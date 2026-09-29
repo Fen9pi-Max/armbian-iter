@@ -45,6 +45,7 @@ LOG_DIR = BASE / "logs"
 TMP = BASE / "tmp"
 QUAR = BASE / "quarantine"
 BOOT = Path("/boot")
+PROC_DT = Path("/proc/device-tree/compatible")
 
 KERNEL_PKGS = ("linux-image-edge-rockchip64", "linux-dtb-edge-rockchip64",
                "linux-headers-edge-rockchip64")
@@ -131,12 +132,35 @@ class RoImage:
 
 
 def host_fdtfile():
-    # 服务器部署时目标板型与服务器无关，fdtfile 由 /etc/armbian-iter.conf 指定
+    """目标板型 dtb 文件名：conf 指定 > 引导环境文件 > 本机设备树推断。
+
+    RK 平台部分固件没有 /boot/armbianEnv.txt（改用 boot.env / uEnv.txt /
+    extlinux），任何来源缺失都不允许抛异常，最终返回 None，
+    由镜像校验环节给出可操作提示。
+    """
     if CONF.get("fdtfile"):
         return CONF["fdtfile"]
-    for line in (BOOT / "armbianEnv.txt").read_text().splitlines():
-        if line.startswith("fdtfile="):
-            return line.split("=", 1)[1].strip()
+    for envf in ("armbianEnv.txt", "boot.env", "uEnv.txt"):
+        p = BOOT / envf
+        if not p.exists():
+            continue
+        for line in p.read_text(errors="replace").splitlines():
+            if line.startswith("fdtfile="):
+                return line.split("=", 1)[1].strip()
+    ext = BOOT / "extlinux" / "extlinux.conf"
+    if ext.exists():
+        for line in ext.read_text(errors="replace").splitlines():
+            parts = line.split()
+            if len(parts) > 1 and parts[0].lower() == "fdt" and parts[1].endswith(".dtb"):
+                return Path(parts[1]).name
+    try:  # 按本机设备树 compatible 推断（仅当服务器与目标板同板型时正确）
+        compat = PROC_DT.read_bytes().split(b"\0")[0].decode()
+        if "," in compat:
+            cand = compat.split(",", 1)[1] + ".dtb"
+            if any((d / cand).exists() for d in BOOT.glob("dtb*") if d.is_dir()):
+                return cand
+    except (OSError, UnicodeDecodeError):
+        pass
     return None
 
 
@@ -371,7 +395,10 @@ def process_artifact(aid):
 
 
 def fdtfile_msg(fdt):
-    return fdt or "本机 armbianEnv.txt 未设置 fdtfile"
+    if fdt:
+        return f"{fdt}（若与目标板型不符，请在 /etc/armbian-iter.conf 设置 fdtfile）"
+    return ("未确定 fdtfile：请在 /etc/armbian-iter.conf 中设置，"
+            '如 {"fdtfile": "rk3588s-skysi-x5.dtb"}')
 
 
 def spawn(aid):
