@@ -34,7 +34,7 @@ import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
-from urllib.parse import unquote
+from urllib.parse import parse_qs, unquote
 
 CONF_PATH = Path(os.environ.get("ITER_CONF", "/etc/armbian-iter.conf"))
 BASE = Path(os.environ.get("ITER_BASE", "/srv/armbian-iter"))
@@ -594,6 +594,8 @@ class Handler(BaseHTTPRequestHandler):
         cl = int(self.headers.get("Content-Length", 0))
         if cl <= 0:
             return self._json(400, {"error": "缺少 Content-Length"})
+        if "sid=" in self.path:
+            return self._upload_chunk(name, cl)
         if name.endswith(".deb"):  # 应用/内核包：直接入池，客户端 apt install 即装
             if shutil.disk_usage("/").free < cl + 2 * 2**30:
                 return self._json(507, {"error": "磁盘空间不足"})
@@ -652,10 +654,62 @@ class Handler(BaseHTTPRequestHandler):
         log.info("接收上传 %s (%.2f GB) → 工件 %s", name, cl / 2**30, aid)
         self._json(202, {"id": aid, "state": "processing"})
 
-    def _stream_to(self, dst: Path, cl: int):
+    def _upload_chunk(self, name, cl):
+        """分块上传：大文件按块接收，单块失败可原块重试，末块完成后走整传一致流程。"""
+        q = parse_qs(self.path.split("?", 1)[1])
+        try:
+            sid = q["sid"][0]
+            seq, total = int(q["seq"][0]), int(q["total"][0])
+            size = int(q.get("size", ["0"])[0])
+        except (KeyError, ValueError):
+            return self._json(400, {"error": "分块参数不完整（需 sid/seq/total）"})
+        if not re.match(r"^[A-Za-z0-9_-]{8,64}$", sid) or not (0 <= seq < total <= 16384):
+            return self._json(400, {"error": "分块参数非法"})
+        TMP.mkdir(parents=True, exist_ok=True)
+        part = TMP / f"chunk-{sid}.part"
+        stf = TMP / f"chunk-{sid}.json"
+        st = json.loads(stf.read_text()) if stf.exists() else None
+        if seq == 0:
+            if name.endswith(".deb"):
+                return self._json(400, {"error": ".deb 无需分块，请直接上传"})
+            if size and shutil.disk_usage(str(BASE)).free < size + int(7.5 * 2**30):
+                return self._json(507, {"error": f"磁盘空间不足（需约 {size // 2**30 + 8} GB）"})
+            st = {"name": name, "size": size}
+        elif not st or st.get("name") != name:
+            return self._json(409, {"error": "上传会话已失效（服务重启或临时文件被清理），请重新上传"})
+        base = 0 if seq == 0 else st["got"]
+        try:
+            self._stream_to(part, cl, mode="wb" if seq == 0 else "ab")
+        except (RuntimeError, OSError) as e:
+            with open(part, "r+b") as f:  # 丢弃半截块，保证后续重试偏移一致
+                f.truncate(base)
+            log.warning("分块上传中断 %s#%d/%d：%s", sid[:12], seq, total, e)
+            self.close_connection = True
+            return self._try_json(507 if disk_full(e) else 400,
+                                  {"error": f"该块传输中断：{e}（已回退，可重试本块）"})
+        st["got"] = base + cl
+        stf.write_text(json.dumps(st))
+        if seq < total - 1:
+            return self._json(200, {"ok": True, "got": st["got"]})
+        aid = time.strftime("%Y%m%d-%H%M%S") + "-" + uuid.uuid4().hex[:6]
+        d = ART_DIR / aid
+        d.mkdir(parents=True)
+        is_img = name.endswith(".img")
+        dst = d / ("image.img" if is_img else "orig.tar.gz")
+        os.replace(part, dst)
+        stf.unlink(missing_ok=True)
+        meta = {"id": aid, "name": name, "size": st["got"],
+                "uploaded_at": time.strftime("%F %T"),
+                "state": "processing", "orig": None if is_img else str(dst)}
+        meta_write(aid, meta)
+        spawn(aid)
+        log.info("分块上传完成 %s (%.2f GB) → 工件 %s", name, st["got"] / 2**30, aid)
+        self._json(202, {"id": aid, "state": "processing"})
+
+    def _stream_to(self, dst: Path, cl: int, mode: str = "wb"):
         h = hashlib.sha256()
         remaining = cl
-        with open(dst, "wb") as f:
+        with open(dst, mode) as f:
             while remaining:
                 chunk = self.rfile.read(min(1024 * 1024, remaining))
                 if not chunk:
@@ -752,7 +806,7 @@ code{background:var(--bg);border:1px solid var(--line);padding:1px 6px;border-ra
 <input type="file" id="file" accept=".tar.gz,.tgz,.img,.deb">
 <button onclick="up()">上传并处理</button>
 <div id="bar"><div id="barfill"></div></div>
-<div class="muted" style="margin-top:8px">镜像（.img/.tar.gz）走后台重打包；直接上传 .deb（内核包或任意应用包）校验后立即入池，客户端 <code>apt update</code> 即可安装。</div>
+<div class="muted" style="margin-top:8px">镜像（.img/.tar.gz）走后台重打包；直接上传 .deb（内核包或任意应用包）校验后立即入池，客户端 <code>apt update</code> 即可安装。超过 16MB 的文件自动分块上传，网络闪断自动重试、不从头重传。</div>
 <div style="margin-top:10px" class="muted">服务器本地路径导入：
 <input type="text" id="lpath" placeholder="/var/tmp/xxx.img 或 .tar.gz 或 .deb" style="max-width:320px">
 <button class="ghost" onclick="imp()">导入</button>
@@ -795,8 +849,13 @@ async function load(){
   $('#arts').innerHTML=ar?'<table><tr><th>工件</th><th>状态</th><th>入池 deb</th><th></th></tr>'+ar+'</table>':'<span class="muted">无</span>';
  }catch(e){$('#stat').innerHTML='<div class="kv"><div class="v" style="color:var(--err)">'+esc(e.message)+'</div></div>'}
 }
+const CHUNK=16*1024*1024;
 function up(){
  const f=$('#file').files[0];if(!f)return alert('先选择文件');
+ if(f.name.endsWith('.deb')||f.size<=CHUNK)return upSingle(f);
+ uploadChunked(f);
+}
+function upSingle(f){
  const x=new XMLHttpRequest();$('#bar').style.display='block';$('#upmsg').textContent='上传中…';
  x.open('POST','/api/upload?name='+encodeURIComponent(f.name));
  x.upload.onprogress=e=>{$('#barfill').style.width=(e.loaded/e.total*100)+'%'};
@@ -804,6 +863,32 @@ function up(){
  x.onerror=()=>{$('#upmsg').textContent='网络错误或连接中断：上传已中止，残留文件服务端会自动清理；大镜像建议改用下方「服务器本地路径导入」'};
  x.onabort=()=>{$('#upmsg').textContent='上传已取消'};
  x.send(f);
+}
+async function uploadChunked(f){
+ const sid=(crypto.randomUUID?crypto.randomUUID().replace(/-/g,''):Date.now().toString(36)+Math.random().toString(36).slice(2));
+ const total=Math.ceil(f.size/CHUNK),t0=Date.now();
+ $('#bar').style.display='block';$('#upmsg').textContent='分块上传中 0%（共 '+total+' 块）…';
+ for(let seq=0;seq<total;seq++){
+  const blob=f.slice(seq*CHUNK,Math.min((seq+1)*CHUNK,f.size));
+  let ok=false,lastErr='';
+  for(let a=1;a<=4&&!ok;a++){
+   try{ok=await new Promise((res,rej)=>{
+    const x=new XMLHttpRequest();
+    x.open('POST','/api/upload?sid='+sid+'&seq='+seq+'&total='+total+'&size='+f.size+'&name='+encodeURIComponent(f.name));
+    x.timeout=300000;
+    x.onload=()=>{if(x.status<200||x.status>=300){lastErr=x.responseText;res(false)}else{if(seq===total-1){try{const j=JSON.parse(x.responseText);$('#upmsg').textContent='已接收 '+j.id+'，后台解包/重打包中（约 2-5 分钟）';setTimeout(load,1500)}catch(e){}}res(true)}};
+    x.onerror=()=>rej(new Error('net'));
+    x.ontimeout=()=>rej(new Error('timeout'));
+    x.send(blob);});}
+   catch(e){ok=false}
+   if(!ok&&a<4){$('#upmsg').textContent='网络波动，块 '+(seq+1)+'/'+total+' 第 '+a+' 次重试（已完成 '+(seq/total*100).toFixed(0)+'%，不从头重传）…';await new Promise(r=>setTimeout(r,a*1500))}
+  }
+  if(!ok){let m='';try{m=JSON.parse(lastErr||'{}').error||''}catch(e){}
+   $('#upmsg').textContent='上传中止：第 '+(seq+1)+'/'+total+' 块连续 4 次失败'+(m?'（'+m+'）':'')+'。请检查网络后重试；大镜像也可改用下方「服务器本地路径导入」。';return}
+  if(seq<total-1){const pct=(seq+1)/total*100;
+   $('#barfill').style.width=pct+'%';
+   $('#upmsg').textContent='上传中 '+pct.toFixed(1)+'%（'+(seq+1)+'/'+total+' 块，'+(((seq+1)*CHUNK/1048576)/((Date.now()-t0)/1000)).toFixed(1)+' MB/s）'}
+ }
 }
 async function imp(){const p=$('#lpath').value.trim();if(!p)return;try{const j=await api('/api/import',{method:'POST',body:JSON.stringify({path:p})});$('#upmsg').textContent=j.id?('已导入 '+j.id+'，后台解包/重打包中（约 2-5 分钟）'):('已入池 '+(j.pkg||j.added)+' '+(j.version||'')+'，客户端 apt update 后可安装');setTimeout(load,1500)}catch(e){alert(e.message)}}
 async function selfpack(){if(!confirm('把本机当前内核重打包入池（回滚基线）？'))return;try{await api('/api/selfpack',{method:'POST'});$('#upmsg').textContent='自打包已开始…';setTimeout(load,2000)}catch(e){alert(e.message)}}
@@ -831,6 +916,8 @@ def main():
             if d.is_dir() and not (d / "meta.json").exists():
                 shutil.rmtree(d, ignore_errors=True)
                 log.info("清理未完成的上传残留 %s", d.name)
+    for p in TMP.glob("chunk-*"):
+        p.unlink(missing_ok=True)  # 分块会话不跨重启续传，残留直接清理
     logging.basicConfig(
         level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s",
         handlers=[logging.StreamHandler(),

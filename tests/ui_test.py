@@ -152,6 +152,34 @@ def main():
             check("池内出现第二个包", lambda: expect(page.locator("#pool")).to_contain_text(
                 "fakeui"))
 
+            print("— 大文件分块上传(11 块,双位序号;首块人为掐断一次,自动重试续传)—")
+            big = tmp / "chunkui.img"
+            with open(big, "wb") as f:
+                f.write(b"\0" * (11 * 16 * 1024 * 1024 + 4096))  # total=11,seq 达两位数
+            seen = {"n": 0}
+
+            def flaky(route):
+                if "sid=" in route.request.url and seen["n"] == 0:
+                    seen["n"] += 1
+                    return route.abort()  # 模拟首块网络闪断
+                route.continue_()
+
+            page.route("**/api/upload*", flaky)
+            page.set_input_files("#file", str(big))
+            page.get_by_role("button", name="上传并处理").click()
+            check("分块上传最终完成", lambda: expect(page.locator("#upmsg")).to_contain_text(
+                "已接收", timeout=60000))
+            assert seen["n"] == 1, "首块未被拦截,重试路径未被验证"
+            PASSED.append("网络中断自动重试(不从头传)")
+            print("  ✓ 网络中断自动重试(不从头传)")
+            page.unroute("**/api/upload*", flaky)
+            check("工件出现(后台处理)", lambda: expect(page.locator("#arts")).to_contain_text(
+                "chunkui.img", timeout=10000))
+            for m in console_errors[allowed_errors:]:
+                assert ("net::ERR_FAILED" in m or "Failed to load resource" in m), \
+                    f"意外控制台错误: {m}"
+            allowed_errors = len(console_errors)
+
             print("— apt 索引一致性 —")
             r = ctx.request.get(base + "/apt/Packages")
             assert r.ok and "helloui" in r.text() and "fakeui" in r.text(), \
