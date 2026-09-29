@@ -74,6 +74,37 @@ def load_conf():
 
 
 CONF = load_conf()
+CONF_MTIME = CONF_PATH.stat().st_mtime if CONF_PATH.exists() else None
+CONF_LOCK = threading.Lock()
+
+
+def maybe_reload_conf():
+    """conf 文件变化时热加载；编辑到一半的半截 JSON 解析失败则保持旧配置。
+
+    端口属于监听参数，热加载后仍需重启才会用新端口。
+    """
+    global CONF, CONF_MTIME
+    try:
+        mtime = CONF_PATH.stat().st_mtime
+    except OSError:
+        return
+    if mtime == CONF_MTIME:
+        return
+    with CONF_LOCK:
+        try:
+            mtime = CONF_PATH.stat().st_mtime
+            if mtime == CONF_MTIME:
+                return
+            nc = json.loads(CONF_PATH.read_text())
+        except (OSError, ValueError) as e:
+            log.warning("conf 解析失败，保持旧配置：%s", e)
+            return
+        if nc.get("port") != CONF.get("port"):
+            log.warning("conf 热加载：端口已变更，需重启服务才会以新端口监听")
+        CONF = nc
+        CONF_MTIME = mtime
+        log.info("conf 已热加载：fdtfile=%s，token=%s", nc.get("fdtfile") or "未设置",
+                 "已设置" if nc.get("token") else "未启用")
 
 
 def run(cmd, timeout=3600, ok_rc=(0,)):
@@ -530,6 +561,7 @@ class Handler(BaseHTTPRequestHandler):
 
     # -- 路由 --
     def _route(self):
+        maybe_reload_conf()
         path = self.path.split("?")[0]
         if path.startswith("/apt/"):
             rel = unquote(path[len("/apt/"):])

@@ -272,9 +272,28 @@ def main():
             check("日志非空", lambda: expect(page.locator("#logv")).not_to_have_text(
                 "(空)", timeout=10000))
 
+            print("— conf 热加载(改配置无需重启)—")
+            (tmp / "conf.json").write_text(json.dumps(
+                {"token": "hot-token-2", "port": port}))
+            r6 = ctx.request.get(base + "/api/status")  # 旧 token:此请求同时触发热加载
+            assert r6.status == 401, f"旧 token 应已失效: {r6.status}"
+            ctx2 = browser.new_context(
+                http_credentials={"username": "x", "password": "hot-token-2"})
+            r7 = ctx2.request.get(base + "/api/status")
+            assert r7.ok, f"新 token 热加载未生效: {r7.status}"
+            ctx2.close()
+            (tmp / "conf.json").write_text(json.dumps(
+                {"token": TOKEN, "port": port}))
+            r8 = ctx.request.get(base + "/api/status")  # 换回并再次热加载
+            assert r8.ok, f"恢复 token 后未热加载回来: {r8.status}"
+            PASSED.append("conf 热加载生效")
+            print("  ✓ conf 热加载生效")
+
             print("— JS 健康门槛(防同类回归)—")
             assert not page_errors, f"页面 JS 异常: {page_errors}"
-            unexpected = console_errors[allowed_errors:]
+            # 401 只可能来自上面刻意做的 token 轮换窗口(页面轮询撞上),放行
+            unexpected = [m for m in console_errors[allowed_errors:]
+                          if "status of 401" not in m]
             assert not unexpected, f"控制台错误: {unexpected}"
             PASSED.append("零 pageerror")
             print("  ✓ 零 pageerror")
