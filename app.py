@@ -14,6 +14,7 @@ Packages/Release 索引，通过 HTTP 提供局域网 apt 源。也可直接上�
 """
 import base64
 import email.utils
+import errno
 import gzip
 import hashlib
 import hmac
@@ -432,9 +433,15 @@ def status():
 
 # ---------- HTTP ----------
 
+def disk_full(e) -> bool:
+    return isinstance(e, OSError) and e.errno in (errno.ENOSPC, errno.EDQUOT)
+
+
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
     server_version = "ArmbianIter/2.0"
+    # socket 空闲上限（秒）：停滞的上传/挂死的连接被礼貌断开，而不是永久占用线程
+    timeout = 600
 
     def log_message(self, fmt, *args):
         log.info("%s %s", self.address_string(), fmt % args)
@@ -461,6 +468,13 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
+
+    def _try_json(self, code, obj):
+        """尽力回复 JSON；客户端已断开时忽略发送失败。"""
+        try:
+            self._json(code, obj)
+        except OSError:
+            pass
 
     # -- 输出 --
     def _json(self, code, obj):
@@ -527,7 +541,13 @@ class Handler(BaseHTTPRequestHandler):
             if path.startswith("/api/upload"):
                 return self._upload()
             if path == "/api/import":
-                req = self._body_json()
+                try:
+                    req = self._body_json()
+                except (RuntimeError, ValueError) as e:
+                    return self._json(400, {"error": f"请求体无效：{e}"})
+                if not isinstance(req, dict):
+                    return self._json(400, {"error": '请求体必须是 JSON 对象，'
+                                                      '如 {"path": "/var/tmp/x.img"}'})
                 return self._import_local(req.get("path", ""))
             if path == "/api/selfpack":
                 if CONF.get("disable_selfpack"):
@@ -582,10 +602,16 @@ class Handler(BaseHTTPRequestHandler):
             recv = TMP / f"recv-{uuid.uuid4().hex[:8]}"
             try:
                 self._stream_to(recv, cl)
-                try:
-                    kv = deb_info(recv)  # 校验损坏包，避免污染索引
-                except RuntimeError as e:
-                    return self._json(400, {"error": str(e)})
+            except (RuntimeError, OSError) as e:
+                log.warning("上传中断已放弃 %s：%s", name, e)
+                self.close_connection = True
+                return self._try_json(507 if disk_full(e) else 400,
+                                      {"error": f"上传中断：{e}"})
+            try:
+                kv = deb_info(recv)  # 校验损坏包，避免污染索引
+            except RuntimeError as e:
+                return self._json(400, {"error": str(e)})
+            try:
                 replaced = (POOL / name).exists()
                 os.replace(recv, POOL / name)
             finally:
@@ -605,7 +631,19 @@ class Handler(BaseHTTPRequestHandler):
         d.mkdir(parents=True)
         is_img = name.endswith(".img")
         dst = d / ("image.img" if is_img else "orig.tar.gz")
-        self._stream_to(dst, cl)
+        try:
+            self._stream_to(dst, cl)
+        except (RuntimeError, OSError) as e:
+            # 连接中断/超时/磁盘满：记日志、清半截文件，绝不让线程裸崩
+            got = dst.stat().st_size if dst.exists() else 0
+            shutil.rmtree(d, ignore_errors=True)
+            self.close_connection = True
+            log.warning("上传中断已放弃 %s（已收 %.2f/%.2f GB，已清理）← %s：%s",
+                        name, got / 2**30, cl / 2**30, self.address_string(), e)
+            return self._try_json(507 if disk_full(e) else 400,
+                                  {"error": f"上传中断：{e}（已接收 "
+                                   f"{got / 2**30:.2f}/{cl / 2**30:.2f} GB，"
+                                   f"残留已自动清理，可直接重试）"})
         meta = {"id": aid, "name": name, "size": cl,
                 "uploaded_at": time.strftime("%F %T"),
                 "state": "processing", "orig": None if is_img else str(dst)}
@@ -666,7 +704,18 @@ class Handler(BaseHTTPRequestHandler):
         log.info("导入本地 %s → 工件 %s（%s）", src, aid, "移动" if movable else "复制")
         self._json(202, {"id": aid, "state": "processing"})
 
-    do_GET = do_POST = do_PUT = do_DELETE = do_HEAD = lambda self: self._route()
+    do_GET = do_POST = do_PUT = do_DELETE = do_HEAD = lambda self: self._safe_route()
+
+    def _safe_route(self):
+        """全局兜底：任何未预期错误收敛为日志 + 500，不允许线程带堆栈裸崩。"""
+        try:
+            self._route()
+        except (BrokenPipeError, ConnectionResetError):
+            self.close_connection = True
+        except Exception as e:  # noqa: BLE001 — 兜底必须收敛
+            log.exception("处理 %s %s 出现未预期错误", self.command, self.path)
+            self.close_connection = True
+            self._try_json(500, {"error": f"服务器内部错误：{e}"})
 
 
 PAGE = """<!doctype html>
@@ -752,7 +801,8 @@ function up(){
  x.open('POST','/api/upload?name='+encodeURIComponent(f.name));
  x.upload.onprogress=e=>{$('#barfill').style.width=(e.loaded/e.total*100)+'%'};
  x.onload=()=>{const j=JSON.parse(x.responseText);if(x.status>299)return alert('失败: '+(j.error||x.status));$('#upmsg').textContent=j.id?('已接收 '+j.id+'，后台解包/重打包中（约 2-5 分钟）'):('已入池 '+(j.pkg||j.added)+' '+(j.version||'')+(j.replaced?'（覆盖同名）':'')+'，客户端 apt update 后可安装');setTimeout(load,1500)};
- x.onerror=()=>{$('#upmsg').textContent='网络错误'};
+ x.onerror=()=>{$('#upmsg').textContent='网络错误或连接中断：上传已中止，残留文件服务端会自动清理；大镜像建议改用下方「服务器本地路径导入」'};
+ x.onabort=()=>{$('#upmsg').textContent='上传已取消'};
  x.send(f);
 }
 async function imp(){const p=$('#lpath').value.trim();if(!p)return;try{const j=await api('/api/import',{method:'POST',body:JSON.stringify({path:p})});$('#upmsg').textContent=j.id?('已导入 '+j.id+'，后台解包/重打包中（约 2-5 分钟）'):('已入池 '+(j.pkg||j.added)+' '+(j.version||'')+'，客户端 apt update 后可安装');setTimeout(load,1500)}catch(e){alert(e.message)}}
@@ -764,9 +814,23 @@ load();loadLog();setInterval(load,5000);setInterval(loadLog,15000);
 </script></body></html>"""
 
 
+class Server(ThreadingHTTPServer):
+    daemon_threads = True
+
+    def handle_error(self, request, client_address):
+        # 连接层异常（客户端断开等）记一行日志即可，不再向 stderr 打堆栈
+        log.warning("连接异常断开 %s", client_address)
+
+
 def main():
     for d in (BASE, REPO, POOL, ART_DIR, LOG_DIR, TMP, QUAR):
         d.mkdir(parents=True, exist_ok=True)
+    if ART_DIR.is_dir():
+        for d in ART_DIR.iterdir():
+            # 清理上次服务停止/断线留下的半截上传（meta.json 在接收完成后才写）
+            if d.is_dir() and not (d / "meta.json").exists():
+                shutil.rmtree(d, ignore_errors=True)
+                log.info("清理未完成的上传残留 %s", d.name)
     logging.basicConfig(
         level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s",
         handlers=[logging.StreamHandler(),
@@ -774,8 +838,7 @@ def main():
     )
     if not (REPO / "Packages").exists():
         build_index()
-    srv = ThreadingHTTPServer(("0.0.0.0", int(CONF["port"])), Handler)
-    srv.daemon_threads = True
+    srv = Server(("0.0.0.0", int(CONF["port"])), Handler)
     log.info("Armbian Iter v2 监听 0.0.0.0:%s（/apt 匿名只读；管理接口 token=%s）",
              CONF["port"], "已启用" if CONF.get("token") else "未启用")
     srv.serve_forever()

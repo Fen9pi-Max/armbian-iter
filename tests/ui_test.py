@@ -13,6 +13,7 @@
     pip install playwright && playwright install --with-deps chromium
     python3 tests/ui_test.py
 """
+import base64
 import json
 import os
 import shutil
@@ -157,6 +158,38 @@ def main():
                 f"apt 索引缺包: {r.status}"
             PASSED.append("Packages 索引含两包")
             print("  ✓ Packages 索引含两包")
+
+            print("— 上传中断韧性(传一半掐断连接,不裸崩、自动清理)—")
+            sk = socket.create_connection(("127.0.0.1", port))
+            auth = base64.b64encode(f"x:{TOKEN}".encode()).decode()
+            sk.sendall((f"POST /api/upload?name=cut.img HTTP/1.1\r\nHost: t\r\n"
+                        f"Authorization: Basic {auth}\r\n"
+                        f"Content-Length: 50000000\r\n\r\n").encode())
+            sk.sendall(b"x" * 100000)
+            sk.close()  # 硬断线
+            time.sleep(1.5)
+            assert proc.poll() is None, "断线导致服务进程崩溃"
+            r3 = ctx.request.get(base + "/api/status")
+            assert r3.ok, f"断线后 status 不可用: {r3.status}"
+            PASSED.append("断线后服务存活")
+            print("  ✓ 断线后服务存活")
+            arts = tmp / "srv" / "artifacts"
+            for dd in (arts.iterdir() if arts.exists() else []):
+                assert (dd / "meta.json").exists(), f"僵尸工件目录: {dd}"
+            PASSED.append("断线上传自动清理")
+            print("  ✓ 断线上传自动清理")
+            r5 = ctx.request.get(base + "/api/logs?n=300")
+            assert "上传中断已放弃" in r5.text(), "中断未记入服务日志"
+            PASSED.append("中断记入日志")
+            print("  ✓ 中断记入日志")
+
+            print("— 非法请求体不裸崩 —")
+            r4 = ctx.request.post(base + "/api/import", data="{bad json",
+                                  headers={"Content-Type": "application/json"})
+            assert r4.status == 400 and "error" in r4.json(), \
+                f"非法 JSON 应返回 400: {r4.status}"
+            PASSED.append("非法请求体返回 400")
+            print("  ✓ 非法请求体返回 400")
 
             print("— 删除池内包 —")
             page.once("dialog", lambda d: d.accept())
