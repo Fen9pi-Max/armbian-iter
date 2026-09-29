@@ -403,8 +403,17 @@ def process_artifact(aid):
                     raise RuntimeError(f"镜像内内核数量异常: {kvers}，仅支持单内核镜像")
                 kver = kvers[0]
                 fdt = host_fdtfile()
-                if not (mnt / "boot" / f"dtb-{kver}" / fdt).exists():
-                    raise RuntimeError(f"镜像缺少本机 dtb（{fdtfile_msg(fdt)}），已拒绝入池")
+                ddir = mnt / "boot" / f"dtb-{kver}"
+                if not (ddir / fdt).exists():
+                    # 把镜像内相近的 dtb 列进报错,免得用户猜文件名
+                    toks = [t for t in re.split(r"[^a-z0-9]+", fdt.lower())
+                            if len(t) >= 3 and t not in ("dtb", "dts")]
+                    cands = [str(p.relative_to(ddir)) for p in ddir.rglob("*.dtb")
+                             if any(t in p.name.lower() for t in toks)]
+                    hint = ("；镜像内相近的 dtb：" + "、".join(cands[:5])) if cands else \
+                        "；镜像 dtb 目录内未找到相近文件"
+                    raise RuntimeError(
+                        f"镜像缺少本机 dtb（{fdtfile_msg(fdt)}），已拒绝入池{hint}")
                 suite = None
                 for line in (mnt / "etc/os-release").read_text().splitlines():
                     if line.startswith("PRETTY_NAME="):
